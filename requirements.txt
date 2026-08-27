@@ -1,5 +1,3 @@
 streamlit
 PyMuPDF
-numpy
 Pillow
-pytesseract
