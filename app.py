@@ -1,14 +1,12 @@
-import io
 import re
 from dataclasses import dataclass
 from typing import Optional
 
 import fitz
 import numpy as np
-import pytesseract
 import streamlit as st
 from PIL import Image
-from pytesseract import Output
+import pytesseract
 
 
 st.set_page_config(
@@ -22,37 +20,19 @@ st.set_page_config(
 class Task:
     number: int
     page: int
-    top: int
-    bottom: int
     image: Image.Image
     text: str
 
 
-# ---------------------------------------------------------
-# Нормализация ответов
-# ---------------------------------------------------------
-
 def normalize_answer(value: str) -> str:
     value = (value or "").strip().lower().replace("ё", "е")
-
-    value = value.replace("—", "-")
-    value = value.replace("–", "-")
-
     value = re.sub(r"[\u00a0\t\r\n]+", " ", value)
     value = re.sub(r"[\s,;.:]+", "", value)
-
+    value = value.replace("—", "-").replace("–", "-")
     return value
 
 
-def check(user: str, correct: str) -> bool:
-    return normalize_answer(user) == normalize_answer(correct)
-
-
-# ---------------------------------------------------------
-# OCR страницы
-# ---------------------------------------------------------
-
-def render_page(page, scale=2.5):
+def render_page(page, scale=1.5):
     pix = page.get_pixmap(
         matrix=fitz.Matrix(scale, scale),
         alpha=False
@@ -60,159 +40,66 @@ def render_page(page, scale=2.5):
 
     return Image.frombytes(
         "RGB",
-        [pix.width, pix.height],
+        (pix.width, pix.height),
         pix.samples
     )
 
 
-def ocr_page(page, scale=2.5):
-    img = render_page(page, scale)
-
-    data = pytesseract.image_to_data(
-        img,
-        lang="rus+eng",
-        config="--psm 6",
-        output_type=Output.DICT
-    )
-
-    return img, data
+def page_text(page) -> str:
+    try:
+        return page.get_text("text") or ""
+    except Exception:
+        return ""
 
 
-# ---------------------------------------------------------
-# Группировка OCR в строки
-# ---------------------------------------------------------
-
-def grouped_lines(data):
-    groups = {}
-
-    n = len(data["text"])
-
-    for i in range(n):
-        text = (data["text"][i] or "").strip()
-
-        if not text:
-            continue
-
-        key = (
-            data["block_num"][i],
-            data["par_num"][i],
-            data["line_num"][i]
-        )
-
-        groups.setdefault(key, []).append(i)
-
-    lines = []
-
-    for indexes in groups.values():
-        indexes.sort(key=lambda i: data["left"][i])
-
-        text = " ".join(
-            data["text"][i].strip()
-            for i in indexes
-            if data["text"][i].strip()
-        )
-
-        top = min(data["top"][i] for i in indexes)
-
-        bottom = max(
-            data["top"][i] + data["height"][i]
-            for i in indexes
-        )
-
-        left = min(data["left"][i] for i in indexes)
-
-        right = max(
-            data["left"][i] + data["width"][i]
-            for i in indexes
-        )
-
-        lines.append(
-            (top, bottom, left, right, text)
-        )
-
-    return sorted(lines, key=lambda x: x[0])
-
-
-# ---------------------------------------------------------
-# Поиск номеров заданий
-# ---------------------------------------------------------
-
-def find_task_numbers(text):
-    """
-    Ищет варианты:
-
-    Задание №1
-    Задание 1
-    Задания №1
-    ЗАДАНИЕ 1
-    №1
-    1.
-    """
+def find_task_number(text: str) -> Optional[int]:
+    if not text:
+        return None
 
     text = text.replace("№", " № ")
 
     patterns = [
-        r"\bзадани[ея]\s*№?\s*(\d{1,3})\b",
-        r"\bзадани[ея]\s+(\d{1,3})\b",
+        r"задани[ея]\s*(?:№\s*)?(\d{1,3})\b",
+        r"задани[ея]\s+(\d{1,3})\b",
     ]
 
     for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
+        match = re.search(pattern, text, re.I)
 
         if match:
-            number = int(match.group(1))
-
-            if 1 <= number <= 200:
-                return number
+            return int(match.group(1))
 
     return None
 
 
-def find_task_headings(lines):
-    found = []
-
-    for top, bottom, left, right, text in lines:
-        number = find_task_numbers(text)
-
-        if number is not None:
-            found.append(
-                (number, top, bottom)
-            )
-
-    # Убираем повторные OCR-распознавания
+def merge_close(values, distance=6):
     result = []
 
-    for item in found:
-        if result:
-            previous = result[-1]
-
-            if (
-                item[0] == previous[0]
-                and abs(item[1] - previous[1]) < 100
-            ):
-                continue
-
-        result.append(item)
+    for value in sorted(values):
+        if not result:
+            result.append(value)
+        elif value - result[-1] > distance:
+            result.append(value)
+        else:
+            result[-1] = (result[-1] + value) / 2
 
     return result
 
 
-# ---------------------------------------------------------
-# Поиск горизонтальных линий
-# ---------------------------------------------------------
-
-def vector_separators(page, scale):
+def horizontal_vector_lines(page):
     """
-    Если PDF содержит настоящие векторные линии,
-    PyMuPDF может увидеть их напрямую.
+    Ищет длинные горизонтальные линии,
+    которые являются настоящими объектами PDF.
     """
 
-    separators = []
+    ys = []
 
     try:
         drawings = page.get_drawings()
     except Exception:
-        return separators
+        return ys
+
+    page_width = page.rect.width
 
     for drawing in drawings:
         for item in drawing.get("items", []):
@@ -220,212 +107,182 @@ def vector_separators(page, scale):
             if not item:
                 continue
 
-            kind = item[0]
-
-            if kind != "l":
+            if item[0] != "l":
                 continue
 
-            p1 = item[1]
-            p2 = item[2]
+            p1, p2 = item[1], item[2]
 
-            x1 = p1.x
-            y1 = p1.y
-            x2 = p2.x
-            y2 = p2.y
+            dx = abs(p2.x - p1.x)
+            dy = abs(p2.y - p1.y)
 
-            # Нас интересуют почти горизонтальные линии
-            if abs(y2 - y1) > 2.5:
-                continue
+            if dy <= 2.5 and dx >= page_width * 0.35:
+                ys.append((p1.y + p2.y) / 2)
 
-            length = abs(x2 - x1)
-
-            # Не считаем маленькие линии
-            if length < 100:
-                continue
-
-            y = ((y1 + y2) / 2) * scale
-
-            separators.append(int(y))
-
-    return separators
+    return sorted(ys)
 
 
-def raster_separators(img: Image.Image):
+def raster_separator_lines(img: Image.Image):
     """
-    Ищет горизонтальные разделители на изображении.
-
-    Поддерживает:
-    - сплошные линии
-    - пунктирные линии
+    Ищет горизонтальные разделители на сканированной странице.
     """
 
-    gray = np.asarray(
-        img.convert("L"),
-        dtype=np.uint8
-    )
+    gray = np.asarray(img.convert("L"))
 
-    height, width = gray.shape
+    dark = gray < 205
 
-    # Чёрные/тёмные пиксели
-    dark = gray < 180
+    counts = dark.sum(axis=1)
 
-    row_counts = dark.sum(axis=1)
+    width = gray.shape[1]
 
     candidates = []
 
-    for y in range(5, height - 5):
+    for y, count in enumerate(counts):
 
-        count = int(row_counts[y])
+        ratio = count / max(width, 1)
 
-        if count == 0:
-            continue
-
-        ratio = count / width
-
-        # -------------------------------------------------
-        # СПЛОШНАЯ линия
-        # -------------------------------------------------
-
-        if ratio >= 0.35:
-            candidates.append(y)
-            continue
-
-        # -------------------------------------------------
-        # ПУНКТИРНАЯ линия
-        # -------------------------------------------------
-
-        row = dark[y]
-
-        # Ищем последовательности тёмных пикселей
-        changes = np.diff(
-            np.concatenate(
-                [[False], row, [False]]
-            ).astype(np.int8)
-        )
-
-        starts = np.where(changes == 1)[0]
-        ends = np.where(changes == -1)[0]
-
-        if len(starts) < 8:
-            continue
-
-        run_lengths = ends - starts
-
-        # Пунктир состоит из большого количества
-        # относительно коротких горизонтальных отрезков
-        short_runs = np.sum(
-            (run_lengths >= 2)
-            & (run_lengths <= 30)
-        )
-
-        span = ends[-1] - starts[0]
-
-        if (
-            short_runs >= 8
-            and span >= width * 0.45
-            and ratio >= 0.015
-            and ratio <= 0.30
-        ):
+        if 0.18 <= ratio <= 0.98:
             candidates.append(y)
 
-    # Объединяем соседние строки одной линии
     clusters = []
 
     for y in candidates:
 
         if not clusters:
             clusters.append([y])
-            continue
 
-        if y - clusters[-1][-1] <= 4:
-            clusters[-1].append(y)
-        else:
+        elif y - clusters[-1][-1] > 2:
             clusters.append([y])
 
-    result = []
+        else:
+            clusters[-1].append(y)
+
+    lines = []
 
     for cluster in clusters:
-        center = int(round(sum(cluster) / len(cluster)))
 
-        # Отбрасываем слишком близкие линии
-        if not result or center - result[-1] > 20:
-            result.append(center)
+        y = int(sum(cluster) / len(cluster))
 
-    return result
+        left = max(0, y - 2)
+        right = min(len(counts), y + 3)
+
+        peak = max(counts[left:right]) / max(width, 1)
+
+        if peak >= 0.18:
+            lines.append(y)
+
+    return merge_close(lines, distance=8)
 
 
-def find_separators(page, img, scale):
+def separator_lines(page, img):
     """
-    Объединяет поиск линий в самом PDF и на картинке.
+    Объединяет линии из PDF и линии, найденные на изображении.
     """
 
-    result = []
+    vector = horizontal_vector_lines(page)
 
-    result.extend(
-        vector_separators(page, scale)
+    scale = img.width / page.rect.width
+
+    vector_px = [
+        int(y * scale)
+        for y in vector
+    ]
+
+    raster = raster_separator_lines(img)
+
+    combined = merge_close(
+        vector_px + raster,
+        distance=10
     )
 
-    result.extend(
-        raster_separators(img)
-    )
+    return combined
 
-    result.sort()
 
-    # Объединяем почти одинаковые линии
-    merged = []
+def ocr_text(img):
+    try:
+        return pytesseract.image_to_string(
+            img,
+            lang="rus+eng",
+            config="--psm 6"
+        )
+    except Exception:
+        return ""
 
-    for y in result:
 
-        if not merged:
-            merged.append(y)
+def crop_text_from_pdf(page, top, bottom):
+    """
+    Быстрый способ получить текст,
+    если PDF уже содержит текстовый слой.
+    """
+
+    try:
+        blocks = page.get_text("blocks")
+    except Exception:
+        return ""
+
+    parts = []
+
+    for block in blocks:
+
+        if len(block) < 5:
             continue
 
-        if abs(y - merged[-1]) <= 12:
-            merged[-1] = int(
-                (merged[-1] + y) / 2
+        x0, y0, x1, y1, text = block[:5]
+
+        if y1 >= top and y0 < bottom and text.strip():
+            parts.append(
+                (y0, text.strip())
             )
-        else:
-            merged.append(y)
 
-    return merged
+    parts.sort(key=lambda x: x[0])
+
+    return "\n".join(
+        text
+        for _, text in parts
+    )
 
 
-# ---------------------------------------------------------
-# Разделение страницы на блоки
-# ---------------------------------------------------------
-
-def build_blocks(img, separators):
+def split_page_into_blocks(page, img):
     """
-    Превращает:
+    Делит страницу на блоки по горизонтальным линиям.
 
-        верх страницы
-        ------
-        задание
-        ------
-        задание
-        ------
-        низ страницы
-
-    в отдельные блоки.
+    Надпись "Задание №..." для разделения
+    больше не обязательна.
     """
 
-    height = img.height
+    lines = separator_lines(page, img)
 
-    useful = []
+    margin = max(
+        12,
+        int(img.height * 0.015)
+    )
 
-    for y in separators:
+    lines = [
+        y
+        for y in lines
+        if margin < y < img.height - margin
+    ]
 
-        if 30 < y < height - 30:
-            useful.append(y)
+    # Если нашли слишком много линий,
+    # оставляем только настоящие векторные линии.
 
-    boundaries = [0]
+    if len(lines) > 25:
 
-    for y in useful:
-        if y - boundaries[-1] >= 80:
-            boundaries.append(y)
+        vector = horizontal_vector_lines(page)
 
-    if height - boundaries[-1] >= 80:
-        boundaries.append(height)
+        scale = img.width / page.rect.width
+
+        lines = [
+            int(y * scale)
+            for y in merge_close(vector, 6)
+        ]
+
+        lines = [
+            y
+            for y in lines
+            if margin < y < img.height - margin
+        ]
+
+    boundaries = [0] + lines + [img.height]
 
     blocks = []
 
@@ -434,83 +291,59 @@ def build_blocks(img, separators):
         boundaries[1:]
     ):
 
-        # Небольшой отступ от самой линии
-        top = a + 8
-        bottom = b - 8
-
-        if bottom - top < 100:
+        if b - a < max(
+            120,
+            int(img.height * 0.06)
+        ):
             continue
 
+        padding = 8
+
+        top_px = max(
+            0,
+            a + padding
+        )
+
+        bottom_px = min(
+            img.height,
+            b - padding
+        )
+
+        crop = img.crop(
+            (
+                0,
+                top_px,
+                img.width,
+                bottom_px
+            )
+        )
+
+        scale = img.width / page.rect.width
+
+        pdf_top = top_px / scale
+        pdf_bottom = bottom_px / scale
+
+        text = crop_text_from_pdf(
+            page,
+            pdf_top,
+            pdf_bottom
+        )
+
+        # OCR используется только если
+        # текстового слоя нет.
+
+        if not text.strip():
+            text = ocr_text(crop)
+
         blocks.append(
-            (top, bottom)
+            (
+                crop,
+                text.strip()
+            )
         )
 
     return blocks
 
-
-# ---------------------------------------------------------
-# OCR блока
-# ---------------------------------------------------------
-
-def ocr_block(crop):
-    text = pytesseract.image_to_string(
-        crop,
-        lang="rus+eng",
-        config="--psm 6"
-    )
-
-    return text.strip()
-
-
-# ---------------------------------------------------------
-# Определение номера задания в блоке
-# ---------------------------------------------------------
-
-def number_from_block(text):
-    number = find_task_numbers(text)
-
-    if number is not None:
-        return number
-
-    # Иногда OCR распознаёт только "№ 5"
-    match = re.search(
-        r"№\s*(\d{1,3})\b",
-        text
-    )
-
-    if match:
-        number = int(match.group(1))
-
-        if 1 <= number <= 200:
-            return number
-
-    # Иногда заголовок выглядит как:
-    # 1. Текст задания
-    lines = [
-        x.strip()
-        for x in text.splitlines()
-        if x.strip()
-    ]
-
-    for line in lines[:4]:
-
-        match = re.match(
-            r"^(\d{1,3})[.)]\s+",
-            line
-        )
-
-        if match:
-            number = int(match.group(1))
-
-            if 1 <= number <= 200:
-                return number
-
-    return None
-
-
-# ---------------------------------------------------------
-# Извлечение заданий
-# ---------------------------------------------------------
 
 def extract_tasks(pdf_bytes: bytes):
 
@@ -521,173 +354,142 @@ def extract_tasks(pdf_bytes: bytes):
 
     tasks = []
 
-    # Масштаб должен совпадать с render_page
-    scale = 2.5
+    next_number = 1
 
-    for page_index, page in enumerate(doc):
+    for page_number, page in enumerate(doc):
+
+        # Страница рендерится один раз.
 
         img = render_page(
             page,
-            scale=scale
+            scale=1.5
         )
 
-        separators = find_separators(
+        blocks = split_page_into_blocks(
             page,
-            img,
-            scale
+            img
         )
 
-        blocks = build_blocks(
-            img,
-            separators
-        )
+        if not blocks:
 
-        # ---------------------------------------------
-        # Сначала пытаемся использовать разделители
-        # ---------------------------------------------
+            text = page_text(page)
 
-        page_tasks = []
+            if not text.strip():
+                text = ocr_text(img)
 
-        for top, bottom in blocks:
-
-            crop = img.crop(
+            blocks = [
                 (
-                    0,
-                    top,
-                    img.width,
-                    bottom
+                    img,
+                    text.strip()
                 )
-            )
+            ]
 
-            text = ocr_block(crop)
+        for crop, text in blocks:
 
-            number = number_from_block(text)
+            number = find_task_number(text)
 
             if number is None:
-                continue
+                number = next_number
 
-            page_tasks.append(
+            tasks.append(
                 Task(
                     number=number,
-                    page=page_index + 1,
-                    top=top,
-                    bottom=bottom,
+                    page=page_number + 1,
                     image=crop,
                     text=text
                 )
             )
 
-        # ---------------------------------------------
-        # Если линии не помогли — используем заголовки
-        # ---------------------------------------------
-
-        if not page_tasks:
-
-            _, data = ocr_page(
-                page,
-                scale=scale
+            next_number = max(
+                next_number,
+                number + 1
             )
 
-            lines = grouped_lines(data)
-            headings = find_task_headings(lines)
+    # Убираем случайные дубли номеров.
 
-            for index, (
-                number,
-                top,
-                bottom
-            ) in enumerate(headings):
+    result = []
 
-                if index + 1 < len(headings):
-                    next_top = headings[index + 1][1]
-                else:
-                    next_top = img.height
-
-                crop_top = max(
-                    0,
-                    top - 25
-                )
-
-                crop_bottom = min(
-                    img.height,
-                    next_top - 10
-                )
-
-                if crop_bottom <= crop_top:
-                    continue
-
-                crop = img.crop(
-                    (
-                        0,
-                        crop_top,
-                        img.width,
-                        crop_bottom
-                    )
-                )
-
-                selected = [
-                    line[4]
-                    for line in lines
-                    if line[0] >= top
-                    and line[0] < next_top
-                ]
-
-                text = "\n".join(selected)
-
-                page_tasks.append(
-                    Task(
-                        number=number,
-                        page=page_index + 1,
-                        top=crop_top,
-                        bottom=crop_bottom,
-                        image=crop,
-                        text=text
-                    )
-                )
-
-        tasks.extend(page_tasks)
-
-    # ---------------------------------------------
-    # Убираем дубли
-    # ---------------------------------------------
-
-    unique = {}
+    used_numbers = set()
 
     for task in tasks:
 
-        # Если номер уже есть, оставляем
-        # первый найденный вариант.
-        if task.number not in unique:
-            unique[task.number] = task
+        if task.number in used_numbers:
+            continue
 
-    return [
-        unique[number]
-        for number in sorted(unique)
-    ]
+        used_numbers.add(task.number)
+
+        result.append(task)
+
+    # Если OCR дал одинаковые номера,
+    # физический порядок блоков важнее OCR.
+
+    if len(result) != len(tasks):
+
+        result = [
+            Task(
+                number=index + 1,
+                page=task.page,
+                image=task.image,
+                text=task.text
+            )
+            for index, task in enumerate(tasks)
+        ]
+
+    return result
 
 
-# ---------------------------------------------------------
-# Поиск ответов
-# ---------------------------------------------------------
+def clean_answer(value: str) -> Optional[str]:
 
-def answer_from_block(block: str) -> Optional[str]:
+    if not value:
+        return None
 
-    clean_lines = [
-        re.sub(r"\s+", " ", line).strip()
-        for line in block.splitlines()
+    value = value.strip()
+
+    value = re.sub(
+        r"\s+",
+        " ",
+        value
+    )
+
+    value = re.sub(
+        r"^(?:ответ|правильный ответ|верный ответ|верные варианты)\s*[:\-]?\s*",
+        "",
+        value,
+        flags=re.I
+    )
+
+    value = value.strip(
+        " .,:;-"
+    )
+
+    if not value:
+        return None
+
+    return value
+
+
+def answer_from_text(text: str):
+
+    if not text:
+        return None
+
+    lines = [
+        re.sub(
+            r"\s+",
+            " ",
+            line
+        ).strip()
+        for line in text.splitlines()
         if line.strip()
     ]
 
-    joined = " ".join(clean_lines)
+    joined = " ".join(lines)
 
     patterns = [
 
-        r"(?:правильный ответ|верные варианты)"
-        r"\s*[:\-]?\s*"
-        r"([0-9][0-9\s,.;-]{0,30})",
+        r"(?:правильный\s+ответ|верный\s+ответ|верные\s+варианты|ответ)\s*[:\-]?\s*([0-9][0-9\s,.;-]{0,30})",
 
-        r"\bответ"
-        r"\s*[:\-]?\s*"
-        r"([0-9][0-9\s,.;-]{0,30})",
+        r"(?:правильный\s+ответ|верный\s+ответ|верные\s+варианты|ответ)\s*[:\-]?\s*([А-ЯA-Z][А-ЯA-Z0-9\s,.;-]{0,20})",
 
     ]
 
@@ -696,52 +498,55 @@ def answer_from_block(block: str) -> Optional[str]:
         match = re.search(
             pattern,
             joined,
-            re.IGNORECASE
+            re.I
         )
 
-        if not match:
-            continue
+        if match:
 
-        raw = match.group(1)
+            answer = clean_answer(
+                match.group(1)
+            )
 
-        raw = re.sub(
-            r"[^0-9\s,;.-]",
-            "",
-            raw
-        )
+            if answer:
+                return answer
 
-        raw = raw.strip(
-            " .;,-"
-        )
-
-        if raw:
-            return raw
-
-    # Второй вариант:
-    # ищем строку после слова "ответ"
-
-    label_seen = False
-
-    for line in clean_lines:
+    for index, line in enumerate(lines):
 
         if re.search(
-            r"(?:правильный ответ|верные варианты|ответ)\b",
+            r"(?:правильный\s+ответ|верные\s+варианты|ответ)\b",
             line,
-            re.IGNORECASE
+            re.I
         ):
-            label_seen = True
-            continue
 
-        if (
-            label_seen
-            and re.fullmatch(
-                r"[0-9][0-9\s,;.-]{0,30}",
-                line
-            )
-        ):
-            return line.strip(
-                " .;,-"
-            )
+            rest = re.sub(
+                r".*?(?:правильный\s+ответ|верные\s+варианты|ответ)\s*[:\-]?\s*",
+                "",
+                line,
+                flags=re.I
+            ).strip()
+
+            if rest:
+
+                answer = clean_answer(rest)
+
+                if answer:
+                    return answer
+
+            for following in lines[
+                index + 1:index + 3
+            ]:
+
+                if re.fullmatch(
+                    r"[0-9А-ЯA-Zа-яa-z][0-9\s,;.\-А-ЯA-Zа-яa-z]{0,30}",
+                    following
+                ):
+
+                    answer = clean_answer(
+                        following
+                    )
+
+                    if answer:
+                        return answer
 
     return None
 
@@ -755,94 +560,87 @@ def extract_answers(pdf_bytes: bytes):
 
     answers = {}
 
-    scale = 2.5
-
     for page in doc:
 
-        img = render_page(
-            page,
-            scale=scale
-        )
+        text = page_text(page)
 
-        separators = find_separators(
-            page,
-            img,
-            scale
-        )
+        if not text.strip():
 
-        blocks = build_blocks(
-            img,
-            separators
-        )
-
-        # Сначала разбираем блоки,
-        # разделённые линиями.
-
-        for top, bottom in blocks:
-
-            crop = img.crop(
-                (
-                    0,
-                    top,
-                    img.width,
-                    bottom
-                )
-            )
-
-            text = ocr_block(crop)
-
-            number = number_from_block(text)
-
-            if number is None:
-                continue
-
-            answer = answer_from_block(text)
-
-            if answer is not None:
-                answers[number] = answer
-
-        # Если ничего не нашли — обычный OCR
-        if not answers:
-
-            _, data = ocr_page(
+            img = render_page(
                 page,
-                scale=scale
+                scale=1.5
             )
 
-            lines = grouped_lines(data)
-            headings = find_task_headings(lines)
+            text = ocr_text(img)
 
-            for index, (
-                number,
-                top,
-                bottom
-            ) in enumerate(headings):
+        matches = list(
+            re.finditer(
+                r"задани[ея]\s*№?\s*(\d{1,3})\b",
+                text,
+                re.I
+            )
+        )
 
-                if index + 1 < len(headings):
-                    next_top = headings[index + 1][1]
-                else:
-                    next_top = img.height
+        if matches:
 
-                block = "\n".join(
-                    line[4]
-                    for line in lines
-                    if line[0] >= top
-                    and line[0] < next_top
+            for index, match in enumerate(matches):
+
+                number = int(
+                    match.group(1)
                 )
 
-                answer = answer_from_block(
+                if index + 1 < len(matches):
+                    end = matches[
+                        index + 1
+                    ].start()
+                else:
+                    end = len(text)
+
+                block = text[
+                    match.start():end
+                ]
+
+                answer = answer_from_text(
                     block
                 )
 
                 if answer is not None:
                     answers[number] = answer
 
+        else:
+
+            labels = re.findall(
+                r"\b(?:ответ|правильный ответ|верные варианты)\b",
+                text,
+                re.I
+            )
+
+            if len(labels) == 1:
+
+                answer = answer_from_text(
+                    text
+                )
+
+                if answer is not None:
+
+                    answers[
+                        len(answers) + 1
+                    ] = answer
+
     return answers
 
 
-# ---------------------------------------------------------
-# Интерфейс
-# ---------------------------------------------------------
+def check_answer(
+    user: str,
+    correct: str
+):
+
+    return (
+        normalize_answer(user)
+        ==
+        normalize_answer(correct)
+    )
+
 
 st.title("Проверяйка")
 
@@ -851,22 +649,21 @@ st.write(
 )
 
 st.info(
-    "Задания разделяются по сплошным и пунктирным "
-    "горизонтальным линиям. Если линии не распознаются, "
-    "программа дополнительно ищет номера заданий через OCR."
+    "Задания разделяются по горизонтальным линиям — "
+    "сплошным или пунктирным. "
+    "Номер задания распознаётся отдельно."
 )
-
 
 homework = st.file_uploader(
     "PDF с домашним заданием",
     type=["pdf"],
-    key="homework"
+    key="homework_pdf"
 )
 
 answers_file = st.file_uploader(
     "PDF с ответами",
     type=["pdf"],
-    key="answers"
+    key="answers_pdf"
 )
 
 
@@ -878,7 +675,7 @@ if homework and answers_file:
     ):
 
         with st.spinner(
-            "Распознаю PDF и разделяю задания..."
+            "Обрабатываю PDF…"
         ):
 
             try:
@@ -887,56 +684,55 @@ if homework and answers_file:
                     homework.getvalue()
                 )
 
-                answers = extract_answers(
+                correct_answers = extract_answers(
                     answers_file.getvalue()
                 )
 
-                st.session_state["tasks"] = tasks
-                st.session_state["answers"] = answers
+                st.session_state[
+                    "tasks"
+                ] = tasks
 
-            except Exception as error:
+                st.session_state[
+                    "correct_answers"
+                ] = correct_answers
+
+            except Exception as exc:
 
                 st.error(
                     "Не удалось обработать PDF."
                 )
 
-                st.exception(error)
+                st.exception(exc)
 
-
-# ---------------------------------------------------------
-# Результат
-# ---------------------------------------------------------
 
 if "tasks" in st.session_state:
 
-    tasks = st.session_state["tasks"]
-    answers = st.session_state.get(
-        "answers",
+    tasks = st.session_state[
+        "tasks"
+    ]
+
+    correct_answers = st.session_state.get(
+        "correct_answers",
         {}
     )
 
     if not tasks:
 
         st.error(
-            "Я не нашёл ни одного задания."
-        )
-
-        st.write(
-            "Проверь, что задания действительно разделены "
-            "горизонтальными линиями и что PDF содержит "
-            "изображения страниц."
+            "Не удалось найти задания."
         )
 
     else:
 
         st.success(
-            f"Найдено заданий: {len(tasks)}"
+            f"Найдено блоков заданий: {len(tasks)}"
         )
 
-        if not answers:
+        if not correct_answers:
 
             st.warning(
-                "Задания найдены, но правильные ответы "
+                "Блоки заданий найдены, "
+                "но правильные ответы из второго PDF "
                 "не распознаны."
             )
 
@@ -951,33 +747,34 @@ if "tasks" in st.session_state:
                 use_container_width=True
             )
 
-            correct = answers.get(
+            correct = correct_answers.get(
                 task.number
             )
 
             if correct is None:
 
                 st.warning(
-                    "Правильный ответ для этого задания "
+                    "Эталонный ответ для этого задания "
                     "не найден."
                 )
 
                 st.text_input(
                     "Твой ответ",
-                    key=f"ans_{task.number}"
+                    key=f"user_answer_{task.number}",
+                    placeholder="Введи ответ"
                 )
 
                 continue
 
             user_answer = st.text_input(
                 "Твой ответ",
-                key=f"ans_{task.number}",
+                key=f"user_answer_{task.number}",
                 placeholder="Введи ответ"
             )
 
             if st.button(
                 "Проверить",
-                key=f"check_{task.number}"
+                key=f"check_button_{task.number}"
             ):
 
                 if not user_answer.strip():
@@ -986,7 +783,7 @@ if "tasks" in st.session_state:
                         "Сначала введи ответ."
                     )
 
-                elif check(
+                elif check_answer(
                     user_answer,
                     correct
                 ):
@@ -1006,9 +803,5 @@ if "tasks" in st.session_state:
             ):
 
                 st.caption(
-                    f"Страница PDF: {task.page}"
-                )
-
-                st.caption(
-                    f"Распознанный эталон: {correct}"
+                    f"Эталон: {correct}"
                 )
